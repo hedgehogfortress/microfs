@@ -390,10 +390,23 @@ final class MicroFileSystem implements FileSystem {
   }
 
   /// Mounts an existing microfs container by reading the Super from [raf].
+  /// Throws [io.FileSystemException] if the container is too small or has a
+  /// corrupt super block.
   static Future<MicroFileSystem> mount(io.RandomAccessFile raf) async {
     await raf.setPosition(0);
     final superBytes = Uint8List.fromList(await raf.read(Super.byteSize));
-    return MicroFileSystem._(raf, Super.fromBytes(superBytes));
+    if (superBytes.length < Super.byteSize) {
+      throw io.FileSystemException('container too small to be valid');
+    }
+    final s = Super.fromBytes(superBytes);
+    if (s.blockSize == 0 || s.maxBlocksPerFile == 0) {
+      throw io.FileSystemException('corrupt super block');
+    }
+    final fileLength = await raf.length();
+    if (fileLength < Super.byteSize + s.blockSize) {
+      throw io.FileSystemException('container too small to be valid');
+    }
+    return MicroFileSystem._(raf, s);
   }
 
   // ---------------------------------------------------------------------------
