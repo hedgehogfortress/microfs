@@ -573,4 +573,294 @@ void main() {
       expect(await raf.length(), equals(expectedSize(stdSuper, 3)));
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // Simulated directories
+  // ---------------------------------------------------------------------------
+  group('Simulated directories', () {
+    late RandomAccessFile raf;
+    late MicroFileSystem fs;
+
+    setUp(() async {
+      raf = await tempMemoryFile();
+      fs = await formatWith(raf, stdSuper);
+    });
+
+    test('nested file path is stored and retrieved correctly', () async {
+      final f = fs.file('foo/bar/baz.txt');
+      await f.writeAsString('hello');
+      expect(await f.exists(), isTrue);
+      expect(await f.readAsString(), equals('hello'));
+      expect(await fs.fileExists('foo/bar/baz.txt'), isTrue);
+    });
+
+    test('directory exists() returns true when files are present under it', () async {
+      await fs.file('a/b.txt').writeAsString('x');
+      expect(await fs.directory('/a').exists(), isTrue);
+    });
+
+    test('directory exists() returns false when no files are present under it', () async {
+      expect(await fs.directory('/ghost').exists(), isFalse);
+    });
+
+    test('directory list() yields direct child files', () async {
+      await fs.file('/top/one.txt').writeAsString('1');
+      await fs.file('/top/two.txt').writeAsString('2');
+      final entities = await fs.directory('/top').list().toList();
+      final names = entities.map((e) => e.basename).toSet();
+      expect(names, equals({'one.txt', 'two.txt'}));
+    });
+
+    test('directory list() yields virtual subdirectory for nested files', () async {
+      await fs.file('/root/sub/file.txt').writeAsString('deep');
+      final entities = await fs.directory('/root').list().toList();
+      expect(entities.length, equals(1));
+      expect(entities.first, isA<Directory>());
+      expect(entities.first.basename, equals('sub'));
+    });
+
+    test('directory list() deduplicates virtual subdirectories', () async {
+      await fs.file('/p/q/a.txt').writeAsString('a');
+      await fs.file('/p/q/b.txt').writeAsString('b');
+      final entities = await fs.directory('/p').list().toList();
+      expect(entities.length, equals(1));
+      expect(entities.first.basename, equals('q'));
+    });
+
+    test('directory list(recursive: true) yields all nested files and dirs',
+        () async {
+      await fs.file('/tree/a.txt').writeAsString('a');
+      await fs.file('/tree/sub/b.txt').writeAsString('b');
+      final entities =
+          await fs.directory('/tree').list(recursive: true).toList();
+      final names = entities.map((e) => e.basename).toSet();
+      expect(names, containsAll({'a.txt', 'sub', 'b.txt'}));
+    });
+
+    test('root list() returns direct-child files and virtual subdirectories', () async {
+      await fs.file('/top.txt').writeAsString('t');
+      await fs.file('/dir/nested.txt').writeAsString('n');
+      final entities = await fs.directory('/').list().toList();
+      final names = entities.map((e) => e.basename).toSet();
+      expect(names, containsAll({'top.txt', 'dir'}));
+      expect(names.length, equals(2));
+    });
+
+    test('childDirectory then childFile builds correct path', () async {
+      await fs.file('/a/b/c.txt').writeAsString('abc');
+      final dir = fs.directory('/a').childDirectory('b');
+      final file = dir.childFile('c.txt');
+      expect(await file.exists(), isTrue);
+      expect(await file.readAsString(), equals('abc'));
+    });
+
+    test('directory delete(recursive: true) removes all children', () async {
+      await fs.file('/del/x.txt').writeAsString('x');
+      await fs.file('/del/sub/y.txt').writeAsString('y');
+      await fs.directory('/del').delete(recursive: true);
+      expect(await fs.fileExists('del/x.txt'), isFalse);
+      expect(await fs.fileExists('del/sub/y.txt'), isFalse);
+      expect(await fs.directory('/del').exists(), isFalse);
+    });
+
+    test('directory delete(recursive: false) throws when non-empty', () async {
+      await fs.file('/notempty/a.txt').writeAsString('a');
+      expect(
+        () => fs.directory('/notempty').delete(),
+        throwsA(isA<FileSystemException>()),
+      );
+    });
+
+    test('directory rename() moves all files under new prefix', () async {
+      await fs.file('/old/x.txt').writeAsString('x content');
+      await fs.file('/old/sub/y.txt').writeAsString('y content');
+      await fs.directory('/old').rename('/new');
+      expect(await fs.fileExists('new/x.txt'), isTrue);
+      expect(await fs.fileExists('new/sub/y.txt'), isTrue);
+      expect(await fs.fileExists('old/x.txt'), isFalse);
+    });
+
+    test('type() returns directory for path with files under it', () async {
+      await fs.file('/d/f.txt').writeAsString('f');
+      expect(await fs.type('/d'), equals(FileSystemEntityType.directory));
+    });
+
+    test('isDirectory returns true for path with files under it', () async {
+      await fs.file('/mydir/file.txt').writeAsString('hi');
+      expect(await fs.isDirectory('/mydir'), isTrue);
+      expect(await fs.isDirectory('/other'), isFalse);
+    });
+
+    test('path too long throws FileSystemException', () async {
+      // 49 UTF-8 bytes (exceeds 48-byte limit)
+      final longName = 'a' * 49;
+      final f = fs.file('/$longName');
+      expect(
+        () => f.create(),
+        throwsA(isA<FileSystemException>()),
+      );
+    });
+
+    test('path at exactly 48 bytes is accepted', () async {
+      final maxName = 'a' * 48;
+      final f = fs.file('/$maxName');
+      await f.create();
+      expect(await f.exists(), isTrue);
+    });
+
+    test('directory path as prefix contributes to name length', () async {
+      // 'dir/' (4) + 'file.txt' (8) = 12 bytes — well within limit
+      final f = fs.file('/dir/file.txt');
+      await f.writeAsString('ok');
+      expect(await f.readAsString(), equals('ok'));
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // file.open() / RandomAccessFile
+  // ---------------------------------------------------------------------------
+  group('file.open / RandomAccessFile', () {
+    late RandomAccessFile raf;
+    late MicroFileSystem fs;
+
+    setUp(() async {
+      raf = await tempMemoryFile();
+      fs = await formatWith(raf, stdSuper);
+    });
+
+    test('open(read) reads existing file content', () async {
+      await fs.file('r.bin').writeAsBytes(Uint8List.fromList([1, 2, 3]));
+      final handle = await fs.file('r.bin').open();
+      expect(await handle.length(), equals(3));
+      expect(await handle.readByte(), equals(1));
+      expect(await handle.readByte(), equals(2));
+      expect(await handle.readByte(), equals(3));
+      await handle.close();
+    });
+
+    test('open(read) on missing file throws FileSystemException', () async {
+      expect(
+        () => fs.file('missing.bin').open(),
+        throwsA(isA<FileSystemException>()),
+      );
+    });
+
+    test('open(write) truncates existing content and writes new data', () async {
+      await fs.file('w.bin').writeAsBytes(Uint8List.fromList([9, 9, 9, 9]));
+      final handle =
+          await fs.file('w.bin').open(mode: FileMode.write);
+      await handle.writeFrom([1, 2]);
+      await handle.close();
+      expect(
+        await fs.file('w.bin').readAsBytes(),
+        equals(Uint8List.fromList([1, 2])),
+      );
+    });
+
+    test('open(append) appends to existing content', () async {
+      await fs.file('a.bin').writeAsBytes(Uint8List.fromList([1, 2]));
+      final handle =
+          await fs.file('a.bin').open(mode: FileMode.append);
+      await handle.writeFrom([3, 4]);
+      await handle.close();
+      expect(
+        await fs.file('a.bin').readAsBytes(),
+        equals(Uint8List.fromList([1, 2, 3, 4])),
+      );
+    });
+
+    test('setPosition and read work correctly', () async {
+      await fs.file('p.bin')
+          .writeAsBytes(Uint8List.fromList([10, 20, 30, 40, 50]));
+      final handle = await fs.file('p.bin').open();
+      await handle.setPosition(2);
+      expect(await handle.position(), equals(2));
+      final chunk = await handle.read(2);
+      expect(chunk, equals(Uint8List.fromList([30, 40])));
+      await handle.close();
+    });
+
+    test('truncate shortens the file on flush', () async {
+      await fs.file('t.bin')
+          .writeAsBytes(Uint8List.fromList([1, 2, 3, 4, 5]));
+      final handle =
+          await fs.file('t.bin').open(mode: FileMode.append);
+      await handle.truncate(3);
+      await handle.close();
+      expect(
+        await fs.file('t.bin').readAsBytes(),
+        equals(Uint8List.fromList([1, 2, 3])),
+      );
+    });
+
+    test('writeByte writes a single byte', () async {
+      final handle =
+          await fs.file('byte.bin').open(mode: FileMode.write);
+      await handle.writeByte(0x42);
+      await handle.close();
+      expect(
+        await fs.file('byte.bin').readAsBytes(),
+        equals(Uint8List.fromList([0x42])),
+      );
+    });
+
+    test('writeString encodes and writes UTF-8', () async {
+      final handle =
+          await fs.file('str.txt').open(mode: FileMode.write);
+      await handle.writeString('hello');
+      await handle.close();
+      expect(await fs.file('str.txt').readAsString(), equals('hello'));
+    });
+
+    test('flush persists without closing', () async {
+      final handle =
+          await fs.file('flush.bin').open(mode: FileMode.write);
+      await handle.writeFrom([7, 8, 9]);
+      await handle.flush();
+      expect(
+        await fs.file('flush.bin').readAsBytes(),
+        equals(Uint8List.fromList([7, 8, 9])),
+      );
+      await handle.close();
+    });
+
+    test('read(read-only) does not persist on close', () async {
+      await fs.file('ro.bin').writeAsBytes(Uint8List.fromList([5]));
+      final handle = await fs.file('ro.bin').open();
+      // Reading does not dirty the buffer, so no write-back occurs.
+      await handle.readByte();
+      await handle.close();
+      expect(
+        await fs.file('ro.bin').readAsBytes(),
+        equals(Uint8List.fromList([5])),
+      );
+    });
+
+    test('readInto fills a list buffer', () async {
+      await fs.file('ri.bin')
+          .writeAsBytes(Uint8List.fromList([10, 20, 30]));
+      final handle = await fs.file('ri.bin').open();
+      final buf = List<int>.filled(3, 0);
+      final count = await handle.readInto(buf);
+      expect(count, equals(3));
+      expect(buf, equals([10, 20, 30]));
+      await handle.close();
+    });
+
+    test('operations on closed handle throw FileSystemException', () async {
+      await fs.file('closed.bin').writeAsBytes(Uint8List.fromList([1]));
+      final handle = await fs.file('closed.bin').open();
+      await handle.close();
+      expect(() => handle.readByte(), throwsA(isA<FileSystemException>()));
+    });
+
+    test('open() on nested path works correctly', () async {
+      await fs.file('/sub/data.bin')
+          .writeAsBytes(Uint8List.fromList([100, 200]));
+      final handle = await fs.file('/sub/data.bin').open();
+      expect(await handle.length(), equals(2));
+      expect(await handle.readByte(), equals(100));
+      await handle.close();
+    });
+  });
 }

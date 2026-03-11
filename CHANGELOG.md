@@ -1,3 +1,7 @@
+## 1.0.3
+
+- Added missing directory methods
+
 ## 1.0.2
 
 - Added more functions to the command line utility.

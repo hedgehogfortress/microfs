@@ -70,14 +70,28 @@ class _MicroFile implements File {
 
   _MicroFile(this._fs, this.path);
 
-  /// The bare filename used as the key inside the microfs container.
-  String get _name => p.posix.basename(path);
+  /// The relative path stored as the filename key inside the container
+  /// (normalized path with the leading '/' stripped).
+  String get _name {
+    final norm = _fs._normalizePath(path);
+    return norm.startsWith('/') ? norm.substring(1) : norm;
+  }
+
+  /// Maximum byte length of a stored filename (UTF-8 encoded).
+  static const int _maxNameBytes = DirectoryEntry.maxFilenameLength;
+
+  /// Throws [io.FileSystemException] if [_name] is too long to store.
+  void _checkNameLength() {
+    if (utf8.encode(_name).length > _maxNameBytes) {
+      throw io.FileSystemException('path too long', path);
+    }
+  }
 
   @override FileSystem get fileSystem => _fs;
   @override bool get isAbsolute => p.posix.isAbsolute(path);
   @override Uri get uri => Uri.file(path, windows: false);
   @override File get absolute => _MicroFile(_fs, isAbsolute ? path : '/$path');
-  @override Directory get parent => _fs._root;
+  @override Directory get parent => _fs.directory(p.posix.dirname(path));
   @override String get basename => p.posix.basename(path);
   @override String get dirname => p.posix.dirname(path);
 
@@ -104,6 +118,7 @@ class _MicroFile implements File {
 
   @override
   Future<File> create({bool recursive = false, bool exclusive = false}) async {
+    _checkNameLength();
     if (!await _fs.fileExists(_name)) {
       await _fs.writeFile(_name, Uint8List(0));
     } else if (exclusive) {
@@ -127,6 +142,7 @@ class _MicroFile implements File {
     final data = await _fs.readFile(_name);
     await _fs.deleteFile(_name);
     final target = _MicroFile(_fs, newPath);
+    target._checkNameLength();
     await _fs.writeFile(target._name, data);
     return target;
   }
@@ -137,6 +153,7 @@ class _MicroFile implements File {
   Future<File> copy(String newPath) async {
     final data = await _fs.readFile(_name);
     final target = _MicroFile(_fs, newPath);
+    target._checkNameLength();
     await _fs.writeFile(target._name, data);
     return target;
   }
@@ -164,6 +181,7 @@ class _MicroFile implements File {
     io.FileMode mode = io.FileMode.write,
     bool flush = false,
   }) async {
+    _checkNameLength();
     final data = mode == io.FileMode.append && await _fs.fileExists(_name)
         ? Uint8List.fromList([...await _fs.readFile(_name), ...bytes])
         : Uint8List.fromList(bytes);
@@ -205,8 +223,10 @@ class _MicroFile implements File {
       throw UnsupportedError('openWrite is not supported; use writeAsBytes');
 
   @override
-  Future<io.RandomAccessFile> open({io.FileMode mode = io.FileMode.read}) =>
-      throw UnsupportedError('open is not supported; use readAsBytes/writeAsBytes');
+  Future<io.RandomAccessFile> open({io.FileMode mode = io.FileMode.read}) async {
+    _checkNameLength();
+    return _MicroRandomAccessFile._open(this, mode);
+  }
 
   @override io.RandomAccessFile openSync({io.FileMode mode = io.FileMode.read}) => _unsync();
 
@@ -241,21 +261,38 @@ class _MicroFile implements File {
 class _MicroDirectory implements Directory {
   final MicroFileSystem _fs;
 
+  /// Normalised path (always starts with '/').
+  @override final String path;
+
   /// POSIX mode 0755 (rwxr-xr-x).
   static const int _dirMode = 0x1ED;
 
-  _MicroDirectory(this._fs);
+  _MicroDirectory(this._fs, [String path = '/'])
+      : path = (path.trim().startsWith('/') ? path.trim() : '/${path.trim()}');
 
-  @override String get path => '/';
+  bool get _isRoot => path == '/';
+
+  /// Relative path prefix used to identify files in this directory
+  /// (e.g. 'foo/bar' for path '/foo/bar'). Empty string for root.
+  String get _relPrefix => _isRoot ? '' : path.substring(1);
+
   @override FileSystem get fileSystem => _fs;
   @override bool get isAbsolute => true;
-  @override Uri get uri => Uri.directory('/');
+  @override Uri get uri => Uri.directory(path);
   @override Directory get absolute => this;
-  @override Directory get parent => this;
-  @override String get basename => '';
-  @override String get dirname => '/';
+  @override Directory get parent =>
+      _isRoot ? this : _fs.directory(p.posix.dirname(path));
+  @override String get basename => _isRoot ? '' : p.posix.basename(path);
+  @override String get dirname => _isRoot ? '/' : p.posix.dirname(path);
 
-  @override Future<bool> exists() => Future.value(true);
+  @override
+  Future<bool> exists() async {
+    if (_isRoot) return true;
+    final prefix = '$_relPrefix/';
+    final files = await _fs.listFiles();
+    return files.any((f) => f.startsWith(prefix));
+  }
+
   @override bool existsSync() => _unsync();
 
   @override
@@ -281,19 +318,70 @@ class _MicroDirectory implements Directory {
   @override Directory createTempSync([String? prefix]) => _unsync();
 
   @override
-  Future<FileSystemEntity> delete({bool recursive = false}) =>
+  Future<FileSystemEntity> delete({bool recursive = false}) async {
+    if (_isRoot) {
       throw io.FileSystemException('cannot delete root directory', path);
+    }
+    final prefix = '$_relPrefix/';
+    final files = await _fs.listFiles();
+    final children = files.where((f) => f.startsWith(prefix)).toList();
+    if (!recursive && children.isNotEmpty) {
+      throw io.FileSystemException('Directory not empty', path);
+    }
+    for (final f in children) {
+      await _fs.deleteFile(f);
+    }
+    return this;
+  }
+
   @override void deleteSync({bool recursive = false}) => _unsync();
 
   @override
-  Future<Directory> rename(String newPath) =>
-      throw UnsupportedError('cannot rename root directory');
+  Future<Directory> rename(String newPath) async {
+    if (_isRoot) throw UnsupportedError('cannot rename root directory');
+    final normalNew = _fs._normalizePath(newPath);
+    final oldPrefix = '$_relPrefix/';
+    final newRelPrefix =
+        normalNew.startsWith('/') ? normalNew.substring(1) : normalNew;
+    final files = await _fs.listFiles();
+    for (final f in files.where((f) => f.startsWith(oldPrefix))) {
+      final data = await _fs.readFile(f);
+      await _fs.deleteFile(f);
+      final newName = '$newRelPrefix/${f.substring(oldPrefix.length)}';
+      await _fs.writeFile(newName, data);
+    }
+    return _MicroDirectory(_fs, newPath);
+  }
+
   @override Directory renameSync(String newPath) => _unsync();
 
   @override
-  Stream<FileSystemEntity> list({bool recursive = false, bool followLinks = true}) =>
-      Stream.fromFuture(_fs.listFiles())
-          .expand((files) => files.map<FileSystemEntity>((f) => _MicroFile(_fs, f)));
+  Stream<FileSystemEntity> list({bool recursive = false, bool followLinks = true}) async* {
+    final files = await _fs.listFiles();
+    final prefix = _isRoot ? '' : '$_relPrefix/';
+    final emittedDirs = <String>{};
+
+    for (final filename in files) {
+      if (!filename.startsWith(prefix)) continue;
+      final relative = filename.substring(prefix.length); // portion after this dir
+      if (relative.isEmpty) continue;
+
+      final slashIdx = relative.indexOf('/');
+      if (slashIdx == -1) {
+        // Direct child file.
+        yield _MicroFile(_fs, '/$filename');
+      } else {
+        // Belongs to a subdirectory.
+        final subdirName = relative.substring(0, slashIdx);
+        final subdirPath = '$path${_isRoot ? '' : '/'}$subdirName';
+        if (emittedDirs.add(subdirPath)) {
+          final subDir = _MicroDirectory(_fs, subdirPath);
+          yield subDir;
+          if (recursive) yield* subDir.list(recursive: true, followLinks: followLinks);
+        }
+      }
+    }
+  }
 
   @override List<FileSystemEntity> listSync({bool recursive = false, bool followLinks = true}) => _unsync();
 
@@ -304,12 +392,14 @@ class _MicroDirectory implements Directory {
   }) => throw UnsupportedError('file watching is not supported');
 
   @override Directory childDirectory(String basename) =>
-      throw UnsupportedError('subdirectories are not supported');
-  @override File childFile(String basename) => _MicroFile(_fs, basename);
-  @override Link childLink(String basename) => _MicroLink(_fs, basename);
+      _MicroDirectory(_fs, '$path${_isRoot ? '' : '/'}$basename');
+  @override File childFile(String basename) =>
+      _MicroFile(_fs, '$path${_isRoot ? '' : '/'}$basename');
+  @override Link childLink(String basename) =>
+      _MicroLink(_fs, '$path${_isRoot ? '' : '/'}$basename');
 
   @override
-  Future<String> resolveSymbolicLinks() => Future.value('/');
+  Future<String> resolveSymbolicLinks() => Future.value(path);
 
   @override
   String resolveSymbolicLinksSync() => _unsync();
@@ -331,7 +421,7 @@ class _MicroLink implements Link {
   @override bool get isAbsolute => p.posix.isAbsolute(path);
   @override Uri get uri => Uri.file(path, windows: false);
   @override Link get absolute => _MicroLink(_fs, isAbsolute ? path : '/$path');
-  @override Directory get parent => _fs._root;
+  @override Directory get parent => _fs.directory(p.posix.dirname(path));
   @override String get basename => p.posix.basename(path);
   @override String get dirname => p.posix.dirname(path);
 
@@ -355,6 +445,208 @@ class _MicroLink implements Link {
   @override String resolveSymbolicLinksSync() => _unsupported();
   @override Future<String> target() => _unsupported();
   @override String targetSync() => _unsupported();
+}
+
+// =============================================================================
+// _MicroRandomAccessFile  (buffer-based RandomAccessFile backed by _MicroFile)
+// =============================================================================
+
+class _MicroRandomAccessFile implements io.RandomAccessFile {
+  final _MicroFile _file;
+  final bool _readOnly;
+  Uint8List _buffer;
+  int _position = 0;
+  bool _dirty = false;
+  bool _closed = false;
+
+  _MicroRandomAccessFile._(this._file, this._readOnly, this._buffer);
+
+  static Future<_MicroRandomAccessFile> _open(
+    _MicroFile file,
+    io.FileMode mode,
+  ) async {
+    final readOnly = mode == io.FileMode.read;
+    final needsExisting = mode == io.FileMode.read ||
+        mode == io.FileMode.append ||
+        mode == io.FileMode.writeOnlyAppend;
+    final truncate =
+        mode == io.FileMode.write || mode == io.FileMode.writeOnly;
+
+    Uint8List buffer;
+    if (truncate) {
+      buffer = Uint8List(0);
+    } else if (needsExisting || await file._fs.fileExists(file._name)) {
+      if (needsExisting && !await file._fs.fileExists(file._name)) {
+        throw io.FileSystemException('File not found', file.path);
+      }
+      buffer = await file._fs.fileExists(file._name)
+          ? await file._fs.readFile(file._name)
+          : Uint8List(0);
+    } else {
+      buffer = Uint8List(0);
+    }
+
+    final raf = _MicroRandomAccessFile._(file, readOnly, buffer);
+    if (mode == io.FileMode.append || mode == io.FileMode.writeOnlyAppend) {
+      raf._position = buffer.length;
+    }
+    return raf;
+  }
+
+  void _checkClosed() {
+    if (_closed) throw io.FileSystemException('RandomAccessFile is closed', _file.path);
+  }
+
+  void _growIfNeeded(int requiredLength) {
+    if (_buffer.length < requiredLength) {
+      final grown = Uint8List(requiredLength);
+      grown.setAll(0, _buffer);
+      _buffer = grown;
+    }
+  }
+
+  @override
+  String get path => _file.path;
+
+  @override
+  Future<void> close() async {
+    _checkClosed();
+    await flush();
+    _closed = true;
+  }
+
+  @override
+  Future<int> readByte() async {
+    _checkClosed();
+    if (_position >= _buffer.length) return -1;
+    return _buffer[_position++];
+  }
+
+  @override
+  Future<Uint8List> read(int bytes) async {
+    _checkClosed();
+    final end = (_position + bytes).clamp(0, _buffer.length);
+    final result = _buffer.sublist(_position, end);
+    _position = end;
+    return result;
+  }
+
+  @override
+  Future<int> readInto(List<int> buffer, [int start = 0, int? end]) async {
+    _checkClosed();
+    final endIdx = end ?? buffer.length;
+    final count = (endIdx - start).clamp(0, _buffer.length - _position);
+    for (var i = 0; i < count; i++) {
+      buffer[start + i] = _buffer[_position + i];
+    }
+    _position += count;
+    return count;
+  }
+
+  @override
+  Future<io.RandomAccessFile> writeByte(int value) async {
+    _checkClosed();
+    _growIfNeeded(_position + 1);
+    _buffer[_position++] = value & 0xFF;
+    _dirty = true;
+    return this;
+  }
+
+  @override
+  Future<io.RandomAccessFile> writeFrom(
+    List<int> buffer, [
+    int start = 0,
+    int? end,
+  ]) async {
+    _checkClosed();
+    final endIdx = end ?? buffer.length;
+    final count = endIdx - start;
+    if (count <= 0) return this;
+    _growIfNeeded(_position + count);
+    for (var i = 0; i < count; i++) {
+      _buffer[_position + i] = buffer[start + i] & 0xFF;
+    }
+    _position += count;
+    _dirty = true;
+    return this;
+  }
+
+  @override
+  Future<io.RandomAccessFile> writeString(
+    String string, {
+    Encoding encoding = utf8,
+  }) => writeFrom(encoding.encode(string));
+
+  @override
+  Future<int> position() async {
+    _checkClosed();
+    return _position;
+  }
+
+  @override
+  Future<io.RandomAccessFile> setPosition(int position) async {
+    _checkClosed();
+    _position = position.clamp(0, _buffer.length);
+    return this;
+  }
+
+  @override
+  Future<io.RandomAccessFile> truncate(int length) async {
+    _checkClosed();
+    if (length < _buffer.length) {
+      _buffer = _buffer.sublist(0, length);
+      if (_position > length) _position = length;
+    } else if (length > _buffer.length) {
+      final grown = Uint8List(length);
+      grown.setAll(0, _buffer);
+      _buffer = grown;
+    }
+    _dirty = true;
+    return this;
+  }
+
+  @override
+  Future<int> length() async {
+    _checkClosed();
+    return _buffer.length;
+  }
+
+  @override
+  Future<io.RandomAccessFile> flush() async {
+    _checkClosed();
+    if (_dirty && !_readOnly) {
+      await _file._fs.writeFile(_file._name, _buffer);
+      _dirty = false;
+    }
+    return this;
+  }
+
+  @override
+  Future<io.RandomAccessFile> lock([
+    io.FileLock mode = io.FileLock.exclusive,
+    int start = 0,
+    int end = -1,
+  ]) async => this;
+
+  @override
+  Future<io.RandomAccessFile> unlock([int start = 0, int end = -1]) async => this;
+
+  // Sync methods — not supported.
+  static Never _unsync() => throw UnsupportedError('sync operations are not supported');
+  @override void closeSync() => _unsync();
+  @override int readByteSync() => _unsync();
+  @override Uint8List readSync(int bytes) => _unsync();
+  @override int readIntoSync(List<int> buffer, [int start = 0, int? end]) => _unsync();
+  @override int writeByteSync(int value) => _unsync();
+  @override void writeFromSync(List<int> buffer, [int start = 0, int? end]) => _unsync();
+  @override void writeStringSync(String string, {Encoding encoding = utf8}) => _unsync();
+  @override int positionSync() => _unsync();
+  @override void setPositionSync(int position) => _unsync();
+  @override void truncateSync(int length) => _unsync();
+  @override int lengthSync() => _unsync();
+  @override void flushSync() => _unsync();
+  @override void lockSync([io.FileLock mode = io.FileLock.exclusive, int start = 0, int end = -1]) => _unsync();
+  @override void unlockSync([int start = 0, int end = -1]) => _unsync();
 }
 
 // =============================================================================
@@ -685,7 +977,7 @@ final class MicroFileSystem implements FileSystem {
   set currentDirectory(dynamic path) {
     final resolved = path is Directory ? path.path : path.toString();
     if (resolved != '/' && resolved.isNotEmpty) {
-      throw UnsupportedError('subdirectories are not supported');
+      throw UnsupportedError('changing current directory is not supported');
     }
   }
 
@@ -702,11 +994,8 @@ final class MicroFileSystem implements FileSystem {
   File file(dynamic path) => _MicroFile(this, _normalizePath(path.toString()));
 
   @override
-  Directory directory(dynamic path) {
-    final normalized = _normalizePath(path.toString());
-    if (normalized == '/') return _root;
-    throw UnsupportedError('subdirectories are not supported');
-  }
+  Directory directory(dynamic path) =>
+      _MicroDirectory(this, _normalizePath(path.toString()));
 
   @override
   Link link(dynamic path) => _MicroLink(this, _normalizePath(path.toString()));
@@ -727,16 +1016,23 @@ final class MicroFileSystem implements FileSystem {
       _normalizePath(path1) == _normalizePath(path2);
 
   @override
-  Future<bool> isFile(String path) => fileExists(p.posix.basename(path));
+  Future<bool> isFile(String path) {
+    final name = _normalizePath(path);
+    final rel = name.startsWith('/') ? name.substring(1) : name;
+    return fileExists(rel);
+  }
 
   @override
   bool isFileSync(String path) =>
       throw UnsupportedError('sync operations are not supported');
 
   @override
-  Future<bool> isDirectory(String path) {
+  Future<bool> isDirectory(String path) async {
     final normalized = _normalizePath(path);
-    return Future.value(normalized == '/');
+    if (normalized == '/') return true;
+    final prefix = '${normalized.substring(1)}/';
+    final files = await listFiles();
+    return files.any((f) => f.startsWith(prefix));
   }
 
   @override
@@ -752,7 +1048,11 @@ final class MicroFileSystem implements FileSystem {
   Future<FileSystemEntityType> type(String path, {bool followLinks = true}) async {
     final normalized = _normalizePath(path);
     if (normalized == '/') return FileSystemEntityType.directory;
-    if (await fileExists(p.posix.basename(path))) return FileSystemEntityType.file;
+    final rel = normalized.substring(1);
+    if (await fileExists(rel)) return FileSystemEntityType.file;
+    final prefix = '$rel/';
+    final files = await listFiles();
+    if (files.any((f) => f.startsWith(prefix))) return FileSystemEntityType.directory;
     return FileSystemEntityType.notFound;
   }
 
