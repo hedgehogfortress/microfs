@@ -27,51 +27,69 @@ dart analyze
 ## Architecture
 
 All logic lives in two source files:
-- `lib/src/data.dart` — `Super`, `Meta`, `DirectoryEntry` (internal serializable data types)
-- `lib/src/filesystem.dart` — `MicroFileSystem` and private implementation classes
+- `lib/src/data.dart` — `DirectoryEntry`, `DirectoryBlock`, `BlockListBlock`, `DataBlock` (internal serialisable data types)
+- `lib/src/engine.dart` — `MicroFsEngine` (low-level block engine)
+- `lib/src/filesystem.dart` — `MicroFileSystem`, `_MicroFile`, `_MicroDirectory`, `_MicroLink` (`package:file` wrappers)
 
-`lib/microfs.dart` exports only `MicroFileSystem` as the public API. The data classes are internal; tests import them directly via `package:microfs/src/data.dart`.
+`lib/microfs.dart` exports `MicroFileSystem` and `MicroFsEngine` as the public API. The data classes are internal; tests import them directly via `package:microfs/src/data.dart`.
 
 **Three conceptual layers inside the source files:**
 
-1. **Serializable data classes** (`Super`, `DirectoryEntry`, `Meta`) — each handles its own binary serialization via `toBytes()` / `fromBytes()`. Offsets are hardcoded constants; changing these is a breaking format change.
+1. **Serialisable data classes** (`DirectoryEntry`, `DirectoryBlock`, `BlockListBlock`, `DataBlock`) — each handles its own binary serialisation via `toBytes()` / `fromBytes()`. Offsets are hardcoded constants; changing these is a breaking format change.
 
-2. **FileSystem implementation** (`MicroFileSystem`, `_MicroFile`, `_MicroDirectory`, `_MicroLink`) — implements the `package:file` interfaces. Only `MicroFileSystem` and `_MicroFile` have meaningful implementations; `_MicroDirectory` is a flat root-only directory, and `_MicroLink` always throws.
+2. **Block engine** (`MicroFsEngine`) — low-level block I/O, block allocation (first-fit via `usedBlocks()` scan), directory traversal, and all file/link/directory CRUD. Does not implement `package:file` interfaces.
 
-3. **Storage** — all reads/writes go through a `RandomAccessFile` (passed in at construction). Block allocation is simple first-fit; the container file grows automatically when more blocks are needed.
+3. **FileSystem wrapper** (`MicroFileSystem`, `_MicroFile`, `_MicroDirectory`, `_MicroLink`) — implements the `package:file` interfaces on top of `MicroFsEngine`. Only `MicroFileSystem` and `_MicroFile` have meaningful implementations; `_MicroDirectory` is a flat root-only directory, and `_MicroLink` always throws.
 
 **Filesystem layout in the container:**
-- Block 0: `Super` (filesystem metadata)
-- Block 1+: Data blocks and `Meta` directory blocks interleaved
+- Block 0: root `DirectoryBlock`
+- Block 1+: `DirectoryBlock` chain extensions, `BlockListBlock`s, and `DataBlock`s interleaved
 
-**Directory model:** Flat namespace — only `/` exists. `Meta` blocks hold `DirectoryEntry` records. When the initial `Meta` block is full, a new one is allocated and chained via `Meta.next`.
+**Block types** (byte 0 of every block):
+- `0x01` `blockTypeDirectory` — directory block holding up to 67 `DirectoryEntry` slots
+- `0x02` `blockTypeBlockList` — block-list block for large files (up to 1022 data-block pointers per block)
+- `0x03` `blockTypeData` — raw file/link payload (4095 bytes of data per block)
+
+**Directory model:** Each directory is a chain of `DirectoryBlock`s linked via `nextDirBlock`. Only `/` exists at the root; subdirectories are allocated `DirectoryBlock` chains of their own. Entries store `type`, `name` (UTF-8, up to 48 bytes), `size`, and `blockIndex`.
+
+**Block allocation:** `allocateBlock()` calls `usedBlocks()` which walks the entire live directory tree collecting every referenced block index. Any index not in the resulting Set is free (first-fit from block 1). Deleted entries are cleared to `DirectoryEntry.empty()`; their blocks are reclaimed implicitly on the next `usedBlocks()` scan (soft delete — no zeroing).
 
 ## Key Conventions
 
 **Async-only (currently):** Every method that does I/O is `async`/`Future`-based. Synchronous variants (e.g., `readAsStringSync`) throw `UnsupportedError` — they haven't been implemented yet, not a permanent design constraint.
 
-**Immutable data classes:** `Super`, `DirectoryEntry`, and `Meta` are declared `final class`. Update by creating new instances, not mutating.
+**Immutable data classes:** `DirectoryEntry`, `DirectoryBlock`, `BlockListBlock`, and `DataBlock` are declared `final class`. Update by creating new instances, not mutating.
 
-**Soft deletes:** Deleted `DirectoryEntry` records stay in the `Meta` block with a `deleted` flag. Slot reuse: when writing a new file, the first deleted slot is reclaimed before allocating a new one.
+**Soft deletes:** Deleted `DirectoryEntry` slots are set to `DirectoryEntry.empty()` (`type == entryTypeEmpty`). Block data is never zeroed; blocks become free simply by no longer being reachable from any live directory entry. Slot reuse: `_insertEntry` scans for the first empty slot before extending the directory chain.
 
-**Error types:** Use `FileSystemException` for I/O and filesystem errors; use `UnsupportedError` for unimplemented features (links, sync ops, subdirectories, renaming, watching).
+**Error types:** Use `FileSystemException` for I/O and filesystem errors; use `UnsupportedError` for unimplemented features (sync ops, watching).
 
-**Path handling:** All paths are normalized to start with `/`. Only POSIX paths are supported — no Windows-style separators.
+**Path handling:** All paths are normalised to start with `/`. Only POSIX paths are supported — no Windows-style separators.
 
-**Filenames:** UTF-8, max 48 bytes. Path separators (`/`) are permitted within filenames — the limit applies to the full stored name including any separators.
+**Filenames:** UTF-8, max 48 bytes per path segment.
 
 ## Testing Patterns
 
 Tests use `package:test`. The helper `tempMemoryFile()` (defined in `test/memory_file.dart`) returns a `RandomAccessFile`-like in-memory file backed by `package:file`'s `MemoryFileSystem` — no disk I/O needed.
 
+Two test files:
+- `test/engine_test.dart` — unit tests for `MicroFsEngine` directly
+- `test/microfs_test.dart` — integration tests via the public `MicroFileSystem` / `package:file` API
+
 Typical test setup:
 ```dart
 // Internal data types are imported directly from src/
 import 'package:microfs/src/data.dart';
+import 'package:microfs/src/engine.dart';
 
-const stdSuper = Super(blockSize: 4096, maxBlocksPerFile: 8);
-final raf = await tempMemoryFile();
-final fs = await MicroFileSystem.format(raf, blockSize: stdSuper.blockSize, maxBlocksPerFile: stdSuper.maxBlocksPerFile);
+Future<MicroFsEngine> freshEngine() async {
+  final raf = await tempMemoryFile();
+  return MicroFsEngine.format(raf);
+}
+
+// Or via the public API:
+Future<MicroFileSystem> freshFs() async =>
+    MicroFileSystem.format(await tempMemoryFile());
 ```
 
-Tests are grouped by feature area (Serialisation, format + mount, Core file operations, Persistence, Meta chain extension, Slot reuse, FileSystem interface, Container growth).
+Tests are grouped by feature area (format + mount, exists / isFile / isDirectory, write + read file, delete file, copy + rename, renameEntry, directory chain extension, blocklist chaining, persistence across remount, usedBlocks, symbolic links).

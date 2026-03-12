@@ -1,29 +1,18 @@
-<!-- 
-This README describes the package. If you publish this package to pub.dev,
-this README's contents appear on the landing page for your package.
-
-For information about how to write a good package README, see the guide for
-[writing package pages](https://dart.dev/tools/pub/writing-package-pages). 
-
-For general information about developing packages, see the Dart guide for
-[creating packages](https://dart.dev/guides/libraries/create-packages)
-and the Flutter guide for
-[developing packages and plugins](https://flutter.dev/to/develop-packages). 
--->
-
-A minimal filesystem stored in a single binary container. Files are stored in
-fixed-size blocks inside any `RandomAccessFile` — a local file, an in-memory
-buffer, or any other backing store. The filesystem implements the
-[`package:file`](https://pub.dev/packages/file) `FileSystem` interface, so it
-works with any code that accepts a `FileSystem`.
+A minimal filesystem stored in a single binary container, implementing the
+[`package:file`](https://pub.dev/packages/file) `FileSystem` interface. Files,
+directories, and symbolic links are stored in fixed-size 4096-byte blocks inside
+any `RandomAccessFile` — a local file, an in-memory buffer, or any other backing
+store.
 
 ## Features
 
-- Stores a flat collection of files in a single binary container
+- Full directory hierarchy — create and nest directories to any depth
+- Symbolic links via `fs.link(path)`
 - Block-based allocation with automatic container growth
-- Implements the `package:file` `FileSystem` interface
+- Implements the `package:file` `FileSystem` interface — works with any code that accepts a `FileSystem`
 - Fully async — backed by `RandomAccessFile`
-- Containers are portable: format once, mount anywhere
+- Portable containers: format once, mount anywhere
+- `File.rename()` replaces an existing file at the destination (crash-safer four-step sequence)
 
 ## Getting started
 
@@ -31,7 +20,7 @@ Add to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  microfs: ^1.0.0
+  microfs: ^2.1.0
   file: ^7.0.0
 ```
 
@@ -40,37 +29,56 @@ dependencies:
 ### Format a new container
 
 ```dart
+import 'dart:io' show FileMode;
 import 'package:file/local.dart';
 import 'package:microfs/microfs.dart';
 
 final localFs = LocalFileSystem();
-final tempDir = await localFs.systemTempDirectory.createTemp('myapp_');
-final raf = await tempDir.childFile('data.bin').open(mode: FileMode.write);
-
-final fs = await MicroFileSystem.format(
-  raf,
-  blockSize: 4096,
-  maxBlocksPerFile: 8,
-);
+final raf = await localFs.file('data.bin').open(mode: FileMode.write);
+final fs = await MicroFileSystem.format(raf);
 ```
 
 ### Write and read files
 
 ```dart
-await fs.file('notes.txt').writeAsString('Hello, microfs!');
+await fs.file('/notes.txt').writeAsString('Hello, microfs!');
 
-final contents = await fs.file('notes.txt').readAsString();
+final contents = await fs.file('/notes.txt').readAsString();
 print(contents); // Hello, microfs!
 
-final bytes = await fs.file('image.png').readAsBytes();
+final bytes = await fs.file('/image.png').readAsBytes();
 ```
 
-### List files
+### Directories
 
 ```dart
-await for (final entity in fs.currentDirectory.list()) {
+await fs.directory('/docs').create();
+await fs.file('/docs/readme.txt').writeAsString('Welcome.');
+
+// Recursive creation
+await fs.file('/a/b/c.txt').writeAsString('deep', recursive: true);
+
+// List root
+await for (final entity in fs.directory('/').list()) {
   print(entity.path);
 }
+```
+
+### Symbolic links
+
+```dart
+await fs.link('/latest').create('/docs/readme.txt');
+print(await fs.link('/latest').target()); // /docs/readme.txt
+```
+
+### Rename / replace
+
+```dart
+// Move to a new name
+await fs.file('/draft.txt').rename('/published.txt');
+
+// Rename onto an existing file — replaces it
+await fs.file('/new.txt').rename('/old.txt');
 ```
 
 ### Mount an existing container
@@ -82,9 +90,6 @@ final fs = await MicroFileSystem.mount(raf);
 
 ## Limitations
 
-- Flat namespace only — no subdirectories
-- No synchronous API (sync methods throw `UnsupportedError`)
-- No symbolic links
+- No synchronous API — sync methods throw `UnsupportedError`
 - No file watching
-- Filenames are UTF-8, max 48 bytes (path separators are permitted within that limit)
-
+- Path segments are UTF-8, max 48 bytes each

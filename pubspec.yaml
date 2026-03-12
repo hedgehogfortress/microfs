@@ -1,6 +1,6 @@
 name: microfs
 description: A minimal filesystem stored in a single binary container, implementing the package:file FileSystem interface.
-version: 2.0.0
+version: 2.1.0
 repository: https://github.com/James1345/microfs
 homepage: https://hedgehogfortress.uk
 
