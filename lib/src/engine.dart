@@ -835,15 +835,11 @@ final class MicroFsEngine {
     }
 
     // Normal rename — destination does not exist.
-
-    // Remove from old location.
-    final fromBlock = await readDirectoryBlock(found.dirBlock);
-    final fromUpdated = List<DirectoryEntry>.from(fromBlock.entries);
-    fromUpdated[found.slot] = DirectoryEntry.empty();
-    await writeDirectoryBlock(
-      found.dirBlock,
-      DirectoryBlock(nextDirBlock: fromBlock.nextDirBlock, entries: fromUpdated),
-    );
+    //
+    // Insert at destination FIRST, then clear the source slot.  If a crash
+    // occurs between the two writes the entry will be visible at both paths
+    // (a transient hard-link), which is recoverable.  The old order
+    // (clear source, then insert) would have lost the entry entirely on a crash.
 
     // Insert in new location with updated name.
     await _insertEntry(
@@ -854,6 +850,15 @@ final class MicroFsEngine {
         size: found.entry.size,
         blockIndex: found.entry.blockIndex,
       ),
+    );
+
+    // Clear source slot.
+    final fromBlock = await readDirectoryBlock(found.dirBlock);
+    final fromUpdated = List<DirectoryEntry>.from(fromBlock.entries);
+    fromUpdated[found.slot] = DirectoryEntry.empty();
+    await writeDirectoryBlock(
+      found.dirBlock,
+      DirectoryBlock(nextDirBlock: fromBlock.nextDirBlock, entries: fromUpdated),
     );
   }
 }
