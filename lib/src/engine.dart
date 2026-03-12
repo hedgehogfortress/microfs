@@ -162,32 +162,7 @@ final class MicroFsEngine {
     return candidate;
   }
 
-  /// Frees all blocks in a file's storage chain rooted at [startBlockIndex].
-  ///
-  /// Since microfs v2 uses first-fit allocation (scanning usedBlocks), there
-  /// is no explicit free-list to update — "freeing" a block simply means it
-  /// will no longer appear in [usedBlocks] because no directory entry references
-  /// it. This method zeroes the blocks so stale data is not misread.
-  Future<void> _freeBlocks(int startBlockIndex) async {
-    final raw = await _readRawBlock(startBlockIndex);
-    final zeroed = Uint8List(blockSize);
 
-    if (raw[0] == blockTypeBlockList) {
-      var blk = BlockListBlock.fromBytes(raw);
-      await _writeRawBlock(startBlockIndex, zeroed);
-      while (true) {
-        for (int i = 0; i < blk.count; i++) {
-          await _writeRawBlock(blk.blockIndices[i], zeroed);
-        }
-        if (blk.nextBlockList == noBlock) break;
-        final next = blk.nextBlockList;
-        blk = await readBlockListBlock(next);
-        await _writeRawBlock(next, zeroed);
-      }
-    } else {
-      await _writeRawBlock(startBlockIndex, zeroed);
-    }
-  }
 
   // ── Directory traversal ─────────────────────────────────────────────────────
 
@@ -489,13 +464,12 @@ final class MicroFsEngine {
     }
     final parentDirBlock = await _resolveDirBlock(parentPath);
 
-    // Hard delete existing file if present
+    // Remove existing file or link if present
     final existing = await _findInDir(parentDirBlock, name);
     if (existing != null) {
       if (existing.entry.type == entryTypeDirectory) {
         throw io.FileSystemException('Path is a directory', path);
       }
-      await _freeBlocks(existing.entry.blockIndex);
       final block = await readDirectoryBlock(existing.dirBlock);
       final updated = List<DirectoryEntry>.from(block.entries);
       updated[existing.slot] = DirectoryEntry.empty();
@@ -543,7 +517,6 @@ final class MicroFsEngine {
     if (found == null || found.entry.type != entryTypeFile) {
       throw io.FileSystemException('File not found', path);
     }
-    await _freeBlocks(found.entry.blockIndex);
     final block = await readDirectoryBlock(found.dirBlock);
     final updated = List<DirectoryEntry>.from(block.entries);
     updated[found.slot] = DirectoryEntry.empty();
@@ -616,8 +589,8 @@ final class MicroFsEngine {
       throw io.FileSystemException('Not a link', path);
     }
 
-    // Free old target blocks
-    await _freeBlocks(found.entry.blockIndex);
+    // Free old target blocks — clearing the entry below is sufficient;
+    // usedBlocks() won't find the old blocks once no entry references them.
 
     // Write new target
     final targetBytes = Uint8List.fromList(utf8.encode(newTarget));
@@ -657,7 +630,6 @@ final class MicroFsEngine {
     if (found == null || found.entry.type != entryTypeLink) {
       throw io.FileSystemException('Link not found', path);
     }
-    await _freeBlocks(found.entry.blockIndex);
     final block = await readDirectoryBlock(found.dirBlock);
     final updated = List<DirectoryEntry>.from(block.entries);
     updated[found.slot] = DirectoryEntry.empty();
@@ -750,9 +722,6 @@ final class MicroFsEngine {
       }
     }
 
-    // Free the directory block chain
-    await _freeDirBlocks(found.entry.blockIndex);
-
     // Remove entry from parent
     final block = await readDirectoryBlock(found.dirBlock);
     final updated = List<DirectoryEntry>.from(block.entries);
@@ -763,18 +732,6 @@ final class MicroFsEngine {
     );
   }
 
-  /// Frees all blocks in a directory block chain (but NOT contents — caller
-  /// must delete contents first).
-  Future<void> _freeDirBlocks(int dirBlockIndex) async {
-    final zeroed = Uint8List(blockSize);
-    int current = dirBlockIndex;
-    while (current != noBlock) {
-      final block = await readDirectoryBlock(current);
-      final next = block.nextDirBlock;
-      await _writeRawBlock(current, zeroed);
-      current = next;
-    }
-  }
 
   /// Copies the file at [src] to [dst].
   Future<void> copyFile(String src, String dst) async {
@@ -861,12 +818,11 @@ final class MicroFsEngine {
         DirectoryBlock(nextDirBlock: srcBlock.nextDirBlock, entries: srcUpdated),
       );
 
-      // Step 4. Free old destination blocks inline.  Re-resolve the parent
-      // since _insertEntry may have extended the directory chain.
+      // Step 4. Clear the temp entry slot — the old destination blocks are now
+      // unreferenced and will be treated as free by usedBlocks().
       final refreshedToParentBlock = await _resolveDirBlock(toParentPath);
       final tempFound = await _findInDir(refreshedToParentBlock, tempName);
       if (tempFound != null) {
-        await _freeBlocks(tempFound.entry.blockIndex);
         final tempBlock = await readDirectoryBlock(tempFound.dirBlock);
         final tempUpdated = List<DirectoryEntry>.from(tempBlock.entries);
         tempUpdated[tempFound.slot] = DirectoryEntry.empty();
