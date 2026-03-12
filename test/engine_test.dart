@@ -337,12 +337,49 @@ void main() {
       expect(asStr(await engine.readFile('/new.txt')), 'data');
     });
 
-    test('rename to existing path throws', () async {
+    test('rename to same path is a no-op', () async {
       final engine = await freshEngine();
-      await engine.writeFile('/a.txt', str('a'));
-      await engine.writeFile('/b.txt', str('b'));
+      await engine.writeFile('/a.txt', str('hello'));
+      await engine.renameEntry('/a.txt', '/a.txt');
+      expect(asStr(await engine.readFile('/a.txt')), 'hello');
+    });
+
+    test('rename replaces existing file', () async {
+      final engine = await freshEngine();
+      await engine.writeFile('/a.txt', str('source'));
+      await engine.writeFile('/b.txt', str('old destination'));
+      await engine.renameEntry('/a.txt', '/b.txt');
+      expect(await engine.exists('/a.txt'), isFalse);
+      expect(asStr(await engine.readFile('/b.txt')), 'source');
+    });
+
+    test('rename replacing file reclaims old destination blocks', () async {
+      final engine = await freshEngine();
+      await engine.writeFile('/a.txt', str('source'));
+      await engine.writeFile('/b.txt', str('old destination'));
+      final beforeBlocks = (await engine.usedBlocks()).length;
+      await engine.renameEntry('/a.txt', '/b.txt');
+      final afterBlocks = (await engine.usedBlocks()).length;
+      // Old destination blocks freed, source blocks retained, so count drops.
+      expect(afterBlocks, lessThan(beforeBlocks));
+    });
+
+    test('rename file over existing directory throws', () async {
+      final engine = await freshEngine();
+      await engine.writeFile('/f.txt', str('data'));
+      await engine.createDirectory('/dir');
       expect(
-        () => engine.renameEntry('/a.txt', '/b.txt'),
+        () => engine.renameEntry('/f.txt', '/dir'),
+        throwsA(isA<Exception>()),
+      );
+    });
+
+    test('rename file over existing link throws', () async {
+      final engine = await freshEngine();
+      await engine.writeFile('/f.txt', str('data'));
+      await engine.createLink('/lnk', '/target');
+      expect(
+        () => engine.renameEntry('/f.txt', '/lnk'),
         throwsA(isA<Exception>()),
       );
     });

@@ -157,6 +157,14 @@ void main() {
       expect(await fs.file('/after.txt').readAsString(), 'content');
     });
 
+    test('rename replaces existing file', () async {
+      await fs.file('/src.txt').writeAsString('new content');
+      await fs.file('/dst.txt').writeAsString('old content');
+      await fs.file('/src.txt').rename('/dst.txt');
+      expect(await fs.file('/src.txt').exists(), isFalse);
+      expect(await fs.file('/dst.txt').readAsString(), 'new content');
+    });
+
     test('copy duplicates file content', () async {
       await fs.file('/orig.txt').writeAsString('data');
       await fs.file('/orig.txt').copy('/copy.txt');

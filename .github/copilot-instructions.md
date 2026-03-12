@@ -1,5 +1,9 @@
 # Copilot Instructions for microfs
 
+## Agent Rules
+
+- **Never run `git commit`** or any command that creates a git commit (e.g. `git commit`, `git commit -m`, `git commit --amend`). Always leave committing to the user.
+
 ## Project Overview
 
 `microfs` is a pure Dart package that implements a CP/M-inspired block-based filesystem stored in a binary container (e.g., a file or memory buffer). It implements the `FileSystem` interface from `package:file`.

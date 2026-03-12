@@ -783,10 +783,16 @@ final class MicroFsEngine {
   }
 
   /// Renames / moves the entry at [from] to [to].
-  /// [to] must not already exist.
+  ///
+  /// If [to] is an existing regular file it is atomically replaced using a
+  /// four-step sequence that biases any crash toward preserving valid data at
+  /// the destination name.  If [to] exists and is a directory or link, or if
+  /// [from] is a directory or link and [to] exists, a [FileSystemException] is
+  /// thrown.
   Future<void> renameEntry(String from, String to) async {
     from = _normalizePath(from);
     to = _normalizePath(to);
+    if (from == to) return;
 
     final fromParentPath = p.posix.dirname(from);
     final fromName = p.posix.basename(from);
@@ -799,13 +805,82 @@ final class MicroFsEngine {
       throw io.FileSystemException('Source not found', from);
     }
 
-    if (await exists(to)) {
-      throw io.FileSystemException('Destination already exists', to);
+    final toParentBlock = await _resolveDirBlock(toParentPath);
+    final existingDest = await _findInDir(toParentBlock, toName);
+
+    if (existingDest != null) {
+      if (found.entry.type != entryTypeFile || existingDest.entry.type != entryTypeFile) {
+        throw io.FileSystemException('Destination already exists', to);
+      }
+
+      // Four-step crash-safer file replacement.  After step 2 the destination
+      // name always points to valid (source) content regardless of crashes.
+      //
+      //   1. Insert a temp entry in the destination's parent — a copy of the
+      //      existing destination entry stored under a \x01-prefixed name.
+      //      The SOH byte (0x01) cannot be produced by normal path operations
+      //      and is not treated as a null terminator by the name serialiser.
+      //   2. Overwrite the destination entry in place with the source's payload.
+      //   3. Clear the source entry slot without freeing its blocks —
+      //      destination now owns them.
+      //   4. Locate the temp entry via _findInDir and free its blocks inline,
+      //      avoiding any path-normalisation edge cases.
+      const tempName = '\x01';
+
+      // Step 1.
+      await _insertEntry(
+        toParentBlock,
+        DirectoryEntry(
+          type: existingDest.entry.type,
+          name: tempName,
+          size: existingDest.entry.size,
+          blockIndex: existingDest.entry.blockIndex,
+        ),
+      );
+
+      // Step 2. Re-read the block because _insertEntry may have written to it.
+      final destBlock = await readDirectoryBlock(existingDest.dirBlock);
+      final destUpdated = List<DirectoryEntry>.from(destBlock.entries);
+      destUpdated[existingDest.slot] = DirectoryEntry(
+        type: found.entry.type,
+        name: toName,
+        size: found.entry.size,
+        blockIndex: found.entry.blockIndex,
+      );
+      await writeDirectoryBlock(
+        existingDest.dirBlock,
+        DirectoryBlock(nextDirBlock: destBlock.nextDirBlock, entries: destUpdated),
+      );
+
+      // Step 3. Clear source slot — do NOT call _freeBlocks, destination owns them.
+      final srcBlock = await readDirectoryBlock(found.dirBlock);
+      final srcUpdated = List<DirectoryEntry>.from(srcBlock.entries);
+      srcUpdated[found.slot] = DirectoryEntry.empty();
+      await writeDirectoryBlock(
+        found.dirBlock,
+        DirectoryBlock(nextDirBlock: srcBlock.nextDirBlock, entries: srcUpdated),
+      );
+
+      // Step 4. Free old destination blocks inline.  Re-resolve the parent
+      // since _insertEntry may have extended the directory chain.
+      final refreshedToParentBlock = await _resolveDirBlock(toParentPath);
+      final tempFound = await _findInDir(refreshedToParentBlock, tempName);
+      if (tempFound != null) {
+        await _freeBlocks(tempFound.entry.blockIndex);
+        final tempBlock = await readDirectoryBlock(tempFound.dirBlock);
+        final tempUpdated = List<DirectoryEntry>.from(tempBlock.entries);
+        tempUpdated[tempFound.slot] = DirectoryEntry.empty();
+        await writeDirectoryBlock(
+          tempFound.dirBlock,
+          DirectoryBlock(nextDirBlock: tempBlock.nextDirBlock, entries: tempUpdated),
+        );
+      }
+      return;
     }
 
-    final toParentBlock = await _resolveDirBlock(toParentPath);
+    // Normal rename — destination does not exist.
 
-    // Remove from old location
+    // Remove from old location.
     final fromBlock = await readDirectoryBlock(found.dirBlock);
     final fromUpdated = List<DirectoryEntry>.from(fromBlock.entries);
     fromUpdated[found.slot] = DirectoryEntry.empty();
@@ -814,7 +889,7 @@ final class MicroFsEngine {
       DirectoryBlock(nextDirBlock: fromBlock.nextDirBlock, entries: fromUpdated),
     );
 
-    // Insert in new location with updated name
+    // Insert in new location with updated name.
     await _insertEntry(
       toParentBlock,
       DirectoryEntry(
