@@ -2,11 +2,9 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:file/file.dart' as pf;
 import 'package:file/local.dart';
 import 'package:microfs/microfs.dart';
-
-const _blockSize = 4096;
-const _maxBlocksPerFile = 64;
 
 void main(List<String> args) async {
   final fmt = args.contains('--fmt');
@@ -36,11 +34,7 @@ void main(List<String> args) async {
       return;
     }
     final raf = await containerFile.open(mode: FileMode.write);
-    fs = await MicroFileSystem.format(
-      raf,
-      blockSize: _blockSize,
-      maxBlocksPerFile: _maxBlocksPerFile,
-    );
+    fs = await MicroFileSystem.format(raf);
     stdout.writeln('Formatted $path.');
   } else {
     if (!await containerFile.exists()) {
@@ -48,7 +42,7 @@ void main(List<String> args) async {
       exitCode = 1;
       return;
     }
-    final raf = await containerFile.open();
+    final raf = await _openReadWrite(containerFile);
     try {
       fs = await MicroFileSystem.mount(raf);
     } catch (e) {
@@ -62,18 +56,25 @@ void main(List<String> args) async {
   await _runShell(fs);
 }
 
+/// Opens [f] for random read-write access without truncating existing content.
+/// Reads the bytes first, reopens with [FileMode.write] (which truncates),
+/// then restores the content so the engine can seek and overwrite freely.
+Future<RandomAccessFile> _openReadWrite(File f) async {
+  final bytes = await f.readAsBytes();
+  final raf = await f.open(mode: FileMode.write);
+  if (bytes.isNotEmpty) await raf.writeFrom(bytes);
+  return raf;
+}
+
 Future<void> _runShell(MicroFileSystem fs) async {
   while (true) {
     stdout.write('microfs> ');
     final line = stdin.readLineSync();
-    if (line == null) break; // EOF
+    if (line == null) break;
 
     final trimmed = line.trim();
     if (trimmed.isEmpty) continue;
 
-    // Parse echo redirections before splitting on whitespace.
-    // Supports:  echo <text> >  <file>   (overwrite)
-    //            echo <text> >> <file>   (append)
     final echoAppend = RegExp(r'^echo\s+(.*?)\s*>>\s*(\S+)$').firstMatch(trimmed);
     final echoWrite = RegExp(r'^echo\s+(.*?)\s*>\s*(\S+)$').firstMatch(trimmed);
     if (echoAppend != null) {
@@ -109,7 +110,6 @@ Future<void> _runShell(MicroFileSystem fs) async {
           await _rm(fs, parts[1]);
         }
       case 'echo':
-        // echo without redirection — print to stdout like a normal shell.
         stdout.writeln(parts.skip(1).join(' '));
       case 'help':
         stdout.writeln('  ls                         list files');
@@ -128,20 +128,27 @@ Future<void> _runShell(MicroFileSystem fs) async {
 }
 
 Future<void> _ls(MicroFileSystem fs) async {
-  final files = await fs.listFiles();
-  if (files.isEmpty) {
+  final entities = await fs.directory('/').list().toList();
+  if (entities.isEmpty) {
     stdout.writeln('(empty)');
     return;
   }
-  for (final name in files) {
-    final size = await fs.fileSize(name);
-    stdout.writeln('${name.padRight(48)}$size');
+  for (final entity in entities) {
+    final name = entity.basename;
+    if (entity is pf.File) {
+      final size = await entity.length();
+      stdout.writeln('${name.padRight(48)}$size');
+    } else if (entity is pf.Directory) {
+      stdout.writeln('${name.padRight(48)}<dir>');
+    } else {
+      stdout.writeln('${name.padRight(48)}<link>');
+    }
   }
 }
 
 Future<void> _cat(MicroFileSystem fs, String filename) async {
   try {
-    final bytes = await fs.readFile(filename);
+    final bytes = await fs.file('/$filename').readAsBytes();
     stdout.write(utf8.decode(bytes, allowMalformed: true));
     if (bytes.isNotEmpty && bytes.last != 0x0A) stdout.writeln();
   } on FileSystemException {
@@ -150,14 +157,16 @@ Future<void> _cat(MicroFileSystem fs, String filename) async {
 }
 
 Future<void> _touch(MicroFileSystem fs, String filename) async {
-  if (!await fs.fileExists(filename)) {
-    await fs.writeFile(filename, Uint8List(0));
+  try {
+    await fs.file('/$filename').create();
+  } on FileSystemException catch (e) {
+    stderr.writeln('touch: $filename: ${e.message}');
   }
 }
 
 Future<void> _rm(MicroFileSystem fs, String filename) async {
   try {
-    await fs.deleteFile(filename);
+    await fs.file('/$filename').delete();
   } on FileSystemException {
     stderr.writeln('rm: $filename: No such file');
   }
@@ -169,18 +178,15 @@ Future<void> _echo(
   String filename, {
   required bool append,
 }) async {
-  final newBytes = utf8.encode('$text\n');
-  final Uint8List data;
-  if (append && await fs.fileExists(filename)) {
-    final existing = await fs.readFile(filename);
-    data = Uint8List.fromList([...existing, ...newBytes]);
-  } else {
-    data = Uint8List.fromList(newBytes);
-  }
+  final newBytes = Uint8List.fromList(utf8.encode('$text\n'));
   try {
-    await fs.writeFile(filename, data);
+    final f = fs.file('/$filename');
+    if (append && await f.exists()) {
+      await f.writeAsBytes(newBytes, mode: FileMode.append);
+    } else {
+      await f.writeAsBytes(newBytes);
+    }
   } on FileSystemException catch (e) {
     stderr.writeln('echo: $filename: ${e.message}');
   }
 }
-
